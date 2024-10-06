@@ -1,9 +1,3 @@
-/// the buffer's current content
-pub struct SubjectBufferSnapshot<'a> {
-    pub buffer: &'a[u8],
-    pub match_offset: usize,
-}
-
 pub struct SubjectBuffer {
     buffer: Box<[u8]>,
 
@@ -19,9 +13,6 @@ pub struct SubjectBuffer {
 
     /// the number of bytes in the buffer
     len: usize,
-
-    /// the current position of pattern matching
-    match_offset: usize,
 
     /// indicates the position of the buffer's beginning inside of the source.  
     /// it may start as a negative value, as the start is padded with zeroed lookbehind bytes
@@ -45,9 +36,12 @@ impl SubjectBuffer {
             max_capacity,
             max_lookbehind,
             len: max_lookbehind,
-            match_offset: max_lookbehind,
             source_offset: -(max_lookbehind as i128),
         })
+    }
+
+    pub fn buffer<'a>(&'a self) -> &'a [u8] {
+        &self.buffer[..self.len]
     }
 
     pub fn len(&self) -> usize {
@@ -69,29 +63,28 @@ impl SubjectBuffer {
         self.max_capacity
     }
  
-    /// read from the input_source into the buffer. new match offset indicates
+    /// read from input_source into the buffer. match offset indicates
     /// the point where matching has stopped.
     ///  - on first read, this must be equal to the max lookbehind (zero for no lookbehind)
     ///  - otherwise, point to beginning of an incomplete match (not including lookbehind)
     ///  - otherwise, on no matches remaining, point to the end of the buffer (get_size())
+    /// 
+    /// match offset will be modified as the buffer is shifted, to keep it in sync.
     ///
-    /// true iff the input is complete (and 0 bytes were added to the buffer)
+    /// returns true iff the input is complete (and 0 bytes were added to the buffer)
     /// 
     /// 1. read
-    /// 2. get_snapshot
-    /// 3. <do pattern matching>
-    /// 4. verify_match
-    /// 5. get_absolute_offset
+    /// 2. <do pattern matching>
+    /// 3. verify_match
+    /// 4. get_absolute_offset
     pub fn read<R: std::io::Read>(
         &mut self,
-        new_match_offset: usize,
+        match_offset: &mut usize,
         input_source: &mut R,
     ) -> Result<bool, Box<dyn std::error::Error>> {
-        debug_assert!(new_match_offset >= self.match_offset);
-        self.match_offset = new_match_offset;
-        debug_assert!(self.match_offset <= self.len);
+        debug_assert!(*match_offset <= self.len);
 
-        if self.match_offset <= self.max_lookbehind {
+        if *match_offset <= self.max_lookbehind {
             // atypical case. no bytes can safely be discarded from the buffer. this
             // is handled by expanding the size of the buffer
             let next_cap = if self.buffer.len() < self.min_capacity {
@@ -117,11 +110,11 @@ impl SubjectBuffer {
             self.buffer = new_buffer
         } else {
             // typical case. see readme docstring for details
-            let num_bytes_discarded = self.match_offset - self.max_lookbehind;
+            let num_bytes_discarded = *match_offset - self.max_lookbehind;
             debug_assert!(num_bytes_discarded > 0); // guarded against, above
             self.buffer.copy_within(num_bytes_discarded..self.len, 0);
             self.len -= num_bytes_discarded;
-            self.match_offset -= num_bytes_discarded;
+            *match_offset -= num_bytes_discarded;
             self.source_offset += num_bytes_discarded as i128;
         }
 
@@ -134,26 +127,6 @@ impl SubjectBuffer {
                 return Ok(read_ret==0);
             },
             Err(e) => return Err(Box::new(e)),
-        }
-    }
-
-    /// returns buffer content at and following the match offset
-    pub fn bytes_to_process<'a>(&'a self) -> &'a [u8] {
-        debug_assert!(self.match_offset >= self.max_lookbehind);
-        debug_assert!(self.match_offset <= self.len);
-        &self.buffer[self.match_offset..self.len]
-    }
-    
-    /// returns the buffer, and the position of matching within it. under all
-    /// circumstances, the match offset will be proceeded by enough bytes to
-    /// satisfy the lookbehind; at the beginning of the source, the beginning is
-    /// padded with null bytes to make this true.
-    pub fn get_snapshot<'a>(&'a self) -> SubjectBufferSnapshot<'a> {
-        debug_assert!(self.match_offset >= self.max_lookbehind);
-        debug_assert!(self.match_offset <= self.len);
-        SubjectBufferSnapshot {
-            buffer: &self.buffer[..self.len],
-            match_offset: self.match_offset,
         }
     }
 
@@ -213,14 +186,17 @@ mod tests {
         let data: &[u8] = b"Hello, world!";
         let mut reader = Cursor::new(data);
 
-        let ret = buffer.read(buffer.max_lookbehind(), &mut reader).unwrap();
+        debug_assert_eq!(buffer.min_capacity(), 20);
+        debug_assert_eq!(buffer.max_capacity(), 0);
+
+        let mut match_offset = buffer.max_lookbehind();
+        let ret = buffer.read(&mut match_offset, &mut reader).unwrap();
         assert!(!ret); // not complete because bytes were read
+        debug_assert!(match_offset == buffer.max_lookbehind()); // no bytes have been discarded - didn't move
+        debug_assert!(buffer.buffer() == data);
 
-        let match_buffer = buffer.get_snapshot();
-        assert!(match_buffer.buffer == data); 
-        assert!(match_buffer.match_offset == 0);
-
-        let ret = buffer.read(buffer.len, &mut reader).unwrap();
+        let mut match_offset = buffer.len();
+        let ret = buffer.read(&mut match_offset, &mut reader).unwrap();
         assert!(buffer.source_offset as usize == data.len());
         assert!(ret); // input complete
     }
@@ -231,36 +207,33 @@ mod tests {
         let data: &[u8] = b"Hello, world!";
         let mut reader = Cursor::new(data);
 
-        assert_eq!(buffer.bytes_to_process(), &[]);
-        let match_buffer = buffer.get_snapshot();
-        assert!(match_buffer.buffer == &[]); 
-        assert!(match_buffer.match_offset == 0);
+        assert_eq!(buffer.buffer(), &[]);
         assert!(buffer.source_offset == 0);
 
-        let ret = buffer.read(buffer.max_lookbehind(), &mut reader).unwrap();
+        let mut match_offset = buffer.max_lookbehind();
+        let ret = buffer.read(&mut match_offset, &mut reader).unwrap();
         assert!(!ret);
 
-        let match_buffer = buffer.get_snapshot();
-        assert!(match_buffer.buffer == &data[0..1]); 
-        assert!(match_buffer.match_offset == 0);
+        assert!(buffer.buffer() == &data[0..1]); 
+        assert!(match_offset == 0);
         assert!(buffer.source_offset == 0);
         assert_eq!(buffer.get_absolute_offset(0), 0);
 
-        let ret = buffer.read(buffer.len, &mut reader).unwrap();
+        let mut match_offset = buffer.len();
+        let ret = buffer.read(&mut match_offset, &mut reader).unwrap();
         assert!(!ret);
 
-        let match_buffer = buffer.get_snapshot();
-        assert!(match_buffer.buffer == &data[1..2]); 
-        assert!(match_buffer.match_offset == 0);
+        assert!(buffer.buffer() == &data[1..2]); 
+        assert!(match_offset == 0); // it was moved back as the byte was discarded
         assert!(buffer.source_offset == 1);
         assert_eq!(buffer.get_absolute_offset(1), 2);
 
-        let ret = buffer.read(buffer.len, &mut reader).unwrap();
+        let mut match_offset = buffer.len();
+        let ret = buffer.read(&mut match_offset, &mut reader).unwrap();
         assert!(!ret);
 
-        let match_buffer = buffer.get_snapshot();
-        assert!(match_buffer.buffer == &data[2..3]); 
-        assert!(match_buffer.match_offset == 0);
+        assert!(buffer.buffer() == &data[2..3]); 
+        assert!(match_offset == 0);
         assert!(buffer.source_offset == 2);
     }
 
@@ -270,29 +243,25 @@ mod tests {
         let data: &[u8] = b"Hello, world!";
         let mut reader = Cursor::new(data);
 
-        assert_eq!(buffer.bytes_to_process(), &[]);
-        let match_buffer = buffer.get_snapshot();
-        assert!(match_buffer.buffer == &[b'\0']); 
-        assert!(match_buffer.match_offset == 1);
+        assert_eq!(buffer.buffer(), &[b'\0']);
         assert!(buffer.source_offset == -1);
 
-        let ret = buffer.read(buffer.max_lookbehind(), &mut reader).unwrap();
+        let mut match_offset = buffer.max_lookbehind();
+        let ret = buffer.read(&mut match_offset, &mut reader).unwrap();
         assert!(!ret);
-        let match_buffer = buffer.get_snapshot();
-        assert_eq!(buffer.bytes_to_process(), &[b'H']);
-        assert!(match_buffer.buffer == &[b'\0', b'H']); 
-        assert!(match_buffer.match_offset == 1);
+        assert!(buffer.buffer() == &[b'\0', b'H']); 
+        assert!(match_offset == 1);
         assert!(buffer.source_offset == -1);
 
         assert_eq!(false, buffer.verify_match(0));
         assert_eq!(true, buffer.verify_match(1));
 
-        let ret = buffer.read(buffer.len, &mut reader).unwrap();
+        let mut match_offset = buffer.len();
+        let ret = buffer.read(&mut match_offset, &mut reader).unwrap();
         assert!(!ret);
 
-        let match_buffer = buffer.get_snapshot();
-        assert!(match_buffer.buffer == &[b'H', b'e']); 
-        assert!(match_buffer.match_offset == 1);
+        assert!(buffer.buffer() == &[b'H', b'e']); 
+        assert!(match_offset == 1);
         assert!(buffer.source_offset == 0);
 
         assert_eq!(true, buffer.verify_match(0));
@@ -305,19 +274,19 @@ mod tests {
         let data: &[u8] = b"Hello, world!";
         let mut reader = Cursor::new(data);
 
-        let ret = buffer.read(buffer.max_lookbehind(), &mut reader).unwrap();
+        let ret = buffer.read(&mut buffer.max_lookbehind(), &mut reader).unwrap();
         assert!(!ret);
         assert_eq!(buffer.len, 2); // set to intial size
 
         // let's say the match offset hasn't been moved forward (still at the beginning)
-        let ret = buffer.read(buffer.max_lookbehind(), &mut reader).unwrap();
+        let mut match_offset = buffer.max_lookbehind();
+        let ret = buffer.read(&mut match_offset, &mut reader).unwrap();
         assert!(!ret);
-        let b = buffer.get_snapshot();
-        assert_eq!(b.buffer, &data[0..4]);
-        assert_eq!(b.match_offset, 0);
+        assert_eq!(buffer.buffer(), &data[0..4]);
+        assert_eq!(match_offset, 0);
 
         // max cap would be surpassed
-        let ret = buffer.read(buffer.max_lookbehind(), &mut reader);
+        let ret = buffer.read(&mut buffer.max_lookbehind(), &mut reader);
         match ret {
             Ok(_) => assert!(false),
             Err(_) => assert!(true),
